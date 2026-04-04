@@ -130,6 +130,7 @@ celerybeat.pid
 
 # ⬇️ Secrets and local env files (never commit credentials; use *.example templates if needed)
 .env
+.env_
 .env.*
 !.env.example
 

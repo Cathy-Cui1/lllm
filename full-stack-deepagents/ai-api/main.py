@@ -5,21 +5,24 @@ FastAPI chat endpoint backed by a deep agent with subagents and optional MCP too
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from langchain.tools import ToolRuntime
 
@@ -50,6 +53,17 @@ GLOBAL_MEMORIES_DIR = STORAGE_DIR / "memories"
 CHECKPOINT_DB_PATH = Path(
     os.environ.get("CHECKPOINT_DB_PATH", str(STORAGE_DIR / "checkpoints.sqlite"))
 )
+## ⬇️ Optional JSON list of MCP servers; when present and non-empty, overrides env-based URLs until cleared via API
+MCP_CONFIG_PATH = STORAGE_DIR / "mcp_config.json"
+
+_MCP_SERVER_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+## ⬇️ Strip a prior attribution line so server-side tool detection can replace wrong model text
+_ATTRIBUTION_LEADING_LINE_RE = re.compile(
+    r"^\s*To answer this question, I used the following tool\(s\):\s*[^\n]+\n*",
+    re.IGNORECASE,
+)
+## ⬇️ Prefix before each tool name in the server-built attribution line (UI)
+_TOOL_ATTRIBUTION_ICON = "🛠️ "
 
 
 def _ensure_memories_dir(memories_dir: Path) -> None:
@@ -138,11 +152,96 @@ class DeleteSessionResponse(BaseModel):
     ok: bool = True
 
 
+class UiChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class SessionPayload(BaseModel):
+    session_id: str
+    title: str
+    messages: list[UiChatMessage]
+
+
+class SessionsListResponse(BaseModel):
+    sessions: list[SessionPayload]
+
+
+class McpServerEntryIn(BaseModel):
+    ## ⬇️ Unique id for MultiServerMCPClient (letters, digits, hyphen, underscore)
+    id: str = Field(..., min_length=1, max_length=64)
+    url: str = Field(..., min_length=1)
+    headers: dict[str, str] = Field(default_factory=dict)
+    ## ⬇️ Soft-removed servers stay in mcp_config.json and can be restored from the settings UI
+    deleted: bool = False
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        if not _MCP_SERVER_ID_RE.match(v.strip()):
+            raise ValueError(
+                "id must start with a letter and contain only letters, digits, hyphen, underscore (max 64 chars)"
+            )
+        return v.strip()
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        u = v.strip()
+        if not (u.startswith("http://") or u.startswith("https://")):
+            raise ValueError("url must be an http(s) MCP Streamable HTTP endpoint")
+        return u
+
+
+class McpSettingsPutBody(BaseModel):
+    servers: list[McpServerEntryIn] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def unique_server_ids(self) -> McpSettingsPutBody:
+        ids = [s.id for s in self.servers]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Each MCP server must have a unique id")
+        return self
+
+
+class McpServerStatusOut(BaseModel):
+    id: str
+    url: str
+    connected: bool
+    tool_count: int
+    error: str | None = None
+    ## ⬇️ Declared HTTP headers for Streamable HTTP (empty when the active config comes from environment variables only)
+    headers: dict[str, str] = Field(default_factory=dict)
+    ## ⬇️ Deleted entries are kept on disk only; they are not connected to the MCP client
+    status: Literal["active", "deleted"] = "active"
+
+
+class McpSettingsResponse(BaseModel):
+    source: Literal["file", "environment"]
+    servers: list[McpServerStatusOut]
+    total_tools: int
+    configured_servers: int
+    connected_servers: int
+
+
+@dataclass(frozen=True)
+class McpServerLoadDetail:
+    tool_count: int
+    connected: bool
+    error: str | None
+
+
+@dataclass
+class McpToolsLoadOutcome:
+    tools: list[Any]
+    per_server: dict[str, McpServerLoadDetail]
+
+
 logger = logging.getLogger(__name__)
 
 
-def _mcp_connections_from_env() -> dict[str, dict[str, str]]:
-    ## ⬇️ Comma-separated Streamable HTTP URLs; if set, replaces the two defaults
+def _mcp_connections_from_env() -> dict[str, dict[str, Any]]:
+    ## ⬇️ Comma-separated Streamable HTTP URLs; if set, replaces the defaults below
     raw = (os.environ.get("MCP_SERVER_URLS") or "").strip()
     if raw:
         urls = [u.strip() for u in raw.split(",") if u.strip()]
@@ -152,57 +251,125 @@ def _mcp_connections_from_env() -> dict[str, dict[str, str]]:
         }
     if os.environ.get("MCP_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
         return {}
-    u1 = (os.environ.get("MCP_RAG_URL") or "http://127.0.0.1:8501/mcp").strip()
-    u2 = (os.environ.get("MCP_AUX_URL") or "http://127.0.0.1:8502/mcp").strip()
-    out: dict[str, dict[str, str]] = {}
-    if u1:
-        out["rag"] = {"transport": "http", "url": u1}
-    if u2:
-        out["aux"] = {"transport": "http", "url": u2}
+    ## ⬇️ mcp-servers/mcp-server-oa (8501), mcp-servers/mcp-server-bingchuan (8503), optional mcp-servers/mcp-server aux (8502); mcp-server-rag is not used
+    u_oa = (os.environ.get("MCP_OA_URL") or "http://127.0.0.1:8501/mcp").strip()
+    u_bc = (os.environ.get("MCP_BINGCHUAN_URL") or "http://127.0.0.1:8503/mcp").strip()
+    u_aux = (os.environ.get("MCP_AUX_URL") or "http://127.0.0.1:8502/mcp").strip()
+    out: dict[str, dict[str, Any]] = {}
+    if u_oa:
+        out["oa"] = {"transport": "http", "url": u_oa}
+    if u_bc:
+        out["bingchuan"] = {"transport": "http", "url": u_bc}
+    if u_aux:
+        out["aux"] = {"transport": "http", "url": u_aux}
     return out
 
 
-async def _load_mcp_tools_per_server(
-    connections: dict[str, dict[str, str]],
-) -> list[Any]:
-    ## ⬇️ Load each MCP server separately so one offline server does not block the other
-    if not connections:
-        return []
-    client = MultiServerMCPClient(connections)
-    all_tools: list[Any] = []
-    for name in connections:
+def _http_mcp_connection(url: str, headers: dict[str, str] | None) -> dict[str, Any]:
+    ## ⬇️ LangChain accepts transport "http" as an alias for Streamable HTTP
+    conn: dict[str, Any] = {"transport": "http", "url": url.strip()}
+    if headers:
+        conn["headers"] = headers
+    return conn
+
+
+def _read_mcp_config_servers_from_disk() -> list[McpServerEntryIn] | None:
+    if not MCP_CONFIG_PATH.is_file():
+        return None
+    try:
+        raw = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+        body = McpSettingsPutBody.model_validate(raw)
+        return body.servers
+    except Exception as e:
+        logger.warning("Ignoring invalid %s: %s", MCP_CONFIG_PATH, e)
+        return None
+
+
+def _resolve_mcp_catalog_and_connections() -> tuple[
+    list[McpServerEntryIn] | None,
+    dict[str, dict[str, Any]],
+    Literal["file", "environment"],
+]:
+    ## ⬇️ Non-empty saved list overrides environment; empty/missing file uses .env defaults; deleted rows stay in file but are omitted from connections
+    entries = _read_mcp_config_servers_from_disk()
+    if entries:
+        conns: dict[str, dict[str, Any]] = {}
+        for s in entries:
+            if s.deleted:
+                continue
+            conns[s.id] = _http_mcp_connection(s.url, s.headers or None)
+        return entries, conns, "file"
+    return None, _mcp_connections_from_env(), "environment"
+
+
+async def _load_mcp_tools_round(
+    connections: dict[str, dict[str, Any]],
+    loaded: dict[str, list[Any]],
+    last_errors: dict[str, BaseException],
+) -> set[str]:
+    ## ⬇️ Load only servers not yet in loaded; returns names that failed this round (caller may retry)
+    pending = {k: v for k, v in connections.items() if k not in loaded}
+    if not pending:
+        return set()
+    client = MultiServerMCPClient(pending)
+    failed: set[str] = set()
+    for name in pending:
         try:
             tools = await client.get_tools(server_name=name)
-            all_tools.extend(tools)
+            loaded[name] = tools
+            last_errors.pop(name, None)
             logger.info("MCP server %r: loaded %s tool(s)", name, len(tools))
-        except Exception:
-            logger.warning("MCP server %r: failed to load tools", name, exc_info=True)
-    return all_tools
+        except Exception as e:  ## ⬅️ expected while peers start; details at DEBUG only
+            failed.add(name)
+            last_errors[name] = e
+            logger.debug("MCP server %r: handshake not ready yet", name, exc_info=True)
+            logger.info("MCP server %r: not ready yet; will retry if attempts remain", name)
+    return failed
 
 
 async def _load_mcp_tools_with_retry(
-    connections: dict[str, dict[str, str]],
+    connections: dict[str, dict[str, Any]],
     *,
     attempts: int = 10,
     delay_sec: float = 1.25,
-) -> list[Any]:
-    ## ⬇️ MCP may start after uvicorn; avoid a single failed handshake leaving the agent tool-less for the whole process
+) -> McpToolsLoadOutcome:
+    ## ⬇️ MCP processes may start after uvicorn; retry until every server loads or attempts exhausted — not "any tools"
     if not connections:
-        return []
-    last: list[Any] = []
+        return McpToolsLoadOutcome(tools=[], per_server={})
+    loaded: dict[str, list[Any]] = {}
+    last_errors: dict[str, BaseException] = {}
     for i in range(attempts):
-        last = await _load_mcp_tools_per_server(connections)
-        if last:
-            return last
+        failed = await _load_mcp_tools_round(connections, loaded, last_errors)
+        if not failed:
+            break
         if i < attempts - 1:
-            logger.warning(
-                "MCP: no tools loaded yet (attempt %s/%s); retrying in %ss",
+            logger.info(
+                "MCP: waiting for %s server(s) [%s]; attempt %s/%s, next retry in %ss",
+                len(failed),
+                ", ".join(sorted(failed)),
                 i + 1,
                 attempts,
                 delay_sec,
             )
             await asyncio.sleep(delay_sec)
-    return last
+    per: dict[str, McpServerLoadDetail] = {}
+    for name in connections:
+        if name in loaded:
+            per[name] = McpServerLoadDetail(len(loaded[name]), True, None)
+            continue
+        err = last_errors.get(name)
+        logger.warning(
+            "MCP server %r: no tools after %s attempts%s",
+            name,
+            attempts,
+            f" — {err}" if err else "",
+        )
+        err_s = str(err) if err else None
+        per[name] = McpServerLoadDetail(0, False, err_s)
+    out: list[Any] = []
+    for name in connections:
+        out.extend(loaded.get(name, []))
+    return McpToolsLoadOutcome(tools=out, per_server=per)
 
 
 def _content_to_text(content: Any) -> str:
@@ -238,6 +405,49 @@ def _last_assistant_reply(messages: list[Any]) -> str:
     return ""
 
 
+def _transcript_for_ui(messages: list[Any]) -> list[UiChatMessage]:
+    ## ⬇️ Skip system/tool/internal turns; only show user + assistant text the UI can render
+    out: list[UiChatMessage] = []
+    for m in messages:
+        if isinstance(m, (SystemMessage, ToolMessage)):
+            continue
+        if isinstance(m, HumanMessage):
+            text = _content_to_text(m.content).strip()
+            if text:
+                out.append(UiChatMessage(role="user", content=text))
+        elif isinstance(m, AIMessage):
+            text = _content_to_text(m.content).strip()
+            if text:
+                out.append(UiChatMessage(role="assistant", content=text))
+    return out
+
+
+def _session_title_from_transcript(rows: list[UiChatMessage]) -> str:
+    ## ⬇️ Match sidebar behaviour: first user line, truncated
+    for row in rows:
+        if row.role == "user" and row.content.strip():
+            t = row.content.strip()
+            return t[:48] + ("…" if len(t) > 48 else "")
+    return "New chat"
+
+
+async def _ordered_thread_ids(checkpointer: AsyncSqliteSaver, *, limit: int) -> list[str]:
+    ## ⬇️ Root graph only (checkpoint_ns ''); one row per conversation thread
+    async with checkpointer.conn.execute(
+        """
+        SELECT thread_id
+        FROM checkpoints
+        WHERE checkpoint_ns = ''
+        GROUP BY thread_id
+        ORDER BY MAX(checkpoint_id) DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ) as cur:
+        fetched = await cur.fetchall()
+    return [str(r[0]) for r in fetched if r and r[0]]
+
+
 def _build_subagents() -> list[dict[str, Any]]:
     ## ⬇️ Two lightweight subagents (no extra tools); main agent may delegate via built-in task tool
     return [
@@ -256,53 +466,208 @@ def _build_subagents() -> list[dict[str, Any]]:
     ]
 
 
+def _connection_url(conn: dict[str, Any]) -> str:
+    return str(conn.get("url") or "")
+
+
+def _ordered_tool_uses(messages: list[Any]) -> list[str]:
+    ## ⬇️ First-seen order of tool calls in the given slice (must be this user turn only — not full thread)
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in messages:
+        if not isinstance(m, ToolMessage):
+            continue
+        name = getattr(m, "name", None)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _tool_attribution_display_names(names: list[str]) -> list[str]:
+    ## ⬇️ Clarify Tavily-backed search; icon before each name for the UI
+    out: list[str] = []
+    for n in names:
+        label = "internet_search (Tavily)" if n == "internet_search" else n
+        out.append(f"{_TOOL_ATTRIBUTION_ICON}{label}")
+    return out
+
+
+def _ensure_tool_attribution(reply: str, tools_used: list[str]) -> str:
+    ## ⬇️ Normalize attribution from actual ToolMessages; removes a wrong leading line from the model
+    if not tools_used:
+        return reply
+    listed = ", ".join(_tool_attribution_display_names(tools_used))
+    marker = "To answer this question, I used the following tool(s)"
+    prefix = f"{marker}: {listed}.\n\n"
+    body = _ATTRIBUTION_LEADING_LINE_RE.sub("", (reply or "").lstrip(), count=1).lstrip()
+    return prefix + body
+
+
+def _compose_agent_system_prompt(local_tools: list[Any], mcp_tools: list[Any]) -> str:
+    ## ⬇️ Matches prior behaviour: OA / Bingchuan hints only when any MCP tool is registered
+    system_prompt = LONG_TERM_MEMORY_SYSTEM_PROMPT + "\n\n"
+    system_prompt += (
+        "You are a helpful assistant. You may delegate to subagents using the task tool "
+        "when their expertise fits the user request. "
+    )
+    system_prompt += (
+        "**Whenever you call any tool** (built-in filesystem tools, `task`, `internet_search`, MCP tools, etc.), "
+        "start your final answer with exactly: "
+        '"To answer this question, I used the following tool(s): " followed by a comma-separated list of the '
+        "exact tool names you invoked (Tavily web search is the tool `internet_search`). "
+        "Use that line only once per reply; omit it only if you used no tools for that answer."
+    )
+    if local_tools:
+        system_prompt += (
+            "You have a local Python tool `internet_search`: use it for web search, current events, "
+            "or facts not covered by internal docs. Pass query, optional max_results (default 5), "
+            "topic (general|news|finance), and include_raw_content as needed. "
+        )
+    if mcp_tools:
+        system_prompt += (
+            "When MCP tools are available: use `lookup_docs` for organization and leave-policy questions "
+            "(OA corpus); use `bingchuan` for 冰雪川 / Bingchuan ice cream or product-knowledge questions; "
+            "use `inspect_faiss_oa` or `inspect_faiss_bingchuan` only for debugging the respective FAISS indexes."
+        )
+    return system_prompt
+
+
+def _mcp_settings_response_from_load(
+    catalog: list[McpServerEntryIn] | None,
+    connections: dict[str, dict[str, Any]],
+    source: Literal["file", "environment"],
+    outcome: McpToolsLoadOutcome,
+) -> McpSettingsResponse:
+    servers: list[McpServerStatusOut] = []
+    if catalog is not None:
+        for entry in catalog:
+            if entry.deleted:
+                servers.append(
+                    McpServerStatusOut(
+                        id=entry.id,
+                        url=entry.url,
+                        connected=False,
+                        tool_count=0,
+                        error=None,
+                        headers=dict(entry.headers or {}),
+                        status="deleted",
+                    )
+                )
+                continue
+            conn = connections.get(entry.id)
+            if conn is None:
+                continue
+            d = outcome.per_server.get(entry.id) or McpServerLoadDetail(0, False, "unknown")
+            raw_h = conn.get("headers")
+            hdrs: dict[str, str] = {}
+            if isinstance(raw_h, dict):
+                hdrs = {str(k): str(v) for k, v in raw_h.items()}
+            servers.append(
+                McpServerStatusOut(
+                    id=entry.id,
+                    url=_connection_url(conn),
+                    connected=d.connected,
+                    tool_count=d.tool_count,
+                    error=d.error,
+                    headers=hdrs,
+                    status="active",
+                )
+            )
+    else:
+        for name in connections:
+            conn = connections[name]
+            d = outcome.per_server.get(name) or McpServerLoadDetail(0, False, "unknown")
+            raw_h = conn.get("headers")
+            hdrs: dict[str, str] = {}
+            if isinstance(raw_h, dict):
+                hdrs = {str(k): str(v) for k, v in raw_h.items()}
+            servers.append(
+                McpServerStatusOut(
+                    id=name,
+                    url=_connection_url(conn),
+                    connected=d.connected,
+                    tool_count=d.tool_count,
+                    error=d.error,
+                    headers=hdrs,
+                    status="active",
+                )
+            )
+    total_tools = sum(s.tool_count for s in servers if s.status == "active")
+    connected_servers = sum(1 for s in servers if s.status == "active" and s.connected)
+    configured_servers = sum(1 for s in servers if s.status == "active")
+    return McpSettingsResponse(
+        source=source,
+        servers=servers,
+        total_tools=total_tools,
+        configured_servers=configured_servers,
+        connected_servers=connected_servers,
+    )
+
+
+def _persist_mcp_settings(body: McpSettingsPutBody) -> None:
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    if not body.servers:
+        if MCP_CONFIG_PATH.exists():
+            MCP_CONFIG_PATH.unlink()
+        return
+    MCP_CONFIG_PATH.write_text(body.model_dump_json(indent=2), encoding="utf-8")
+
+
+async def _build_agent_and_mcp_status(fastapi_app: FastAPI) -> McpSettingsResponse:
+    model = fastapi_app.state.chat_model
+    checkpointer = fastapi_app.state.checkpointer
+    catalog, connections, source = _resolve_mcp_catalog_and_connections()
+    outcome = await _load_mcp_tools_with_retry(connections)
+    mcp_tools = outcome.tools
+    if connections and not mcp_tools:
+        logger.warning(
+            "No MCP tools loaded (%s server(s) configured); agent runs without MCP tools",
+            len(connections),
+        )
+    local_tools = get_local_tools()
+    if local_tools:
+        logger.info("Local tools: registered %s (Tavily internet_search)", len(local_tools))
+    else:
+        logger.info("Local tools: none (set TAVILY_API_KEY for internet_search)")
+    all_tools = [*local_tools, *mcp_tools]
+    system_prompt = _compose_agent_system_prompt(local_tools, mcp_tools)
+    agent = create_deep_agent(
+        model=model,
+        tools=all_tools,
+        system_prompt=system_prompt,
+        subagents=_build_subagents(),
+        checkpointer=checkpointer,
+        backend=make_memory_backend,
+    )
+    fastapi_app.state.agent = agent
+    resp = _mcp_settings_response_from_load(catalog, connections, source, outcome)
+    fastapi_app.state.mcp_settings_response = resp
+    logger.info(
+        "MCP summary: source=%s total_tools=%s connected_servers=%s/%s",
+        source,
+        resp.total_tools,
+        resp.connected_servers,
+        resp.configured_servers,
+    )
+    return resp
+
+
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     model = init_chat_model(DEFAULT_MODEL)
     _ensure_storage_dir_for_db(CHECKPOINT_DB_PATH)
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH)) as checkpointer:
         await checkpointer.setup()
-        connections = _mcp_connections_from_env()
-        mcp_tools = await _load_mcp_tools_with_retry(connections)
-        if connections and not mcp_tools:
-            logger.warning(
-                "No MCP tools loaded (%s server(s) configured); agent runs without MCP tools",
-                len(connections),
-            )
-        local_tools = get_local_tools()
-        if local_tools:
-            logger.info("Local tools: registered %s (Tavily internet_search)", len(local_tools))
-        else:
-            logger.info("Local tools: none (set TAVILY_API_KEY for internet_search)")
-        all_tools = [*local_tools, *mcp_tools]
-        system_prompt = LONG_TERM_MEMORY_SYSTEM_PROMPT + "\n\n"
-        system_prompt += (
-            "You are a helpful assistant. You may delegate to subagents using the task tool "
-            "when their expertise fits the user request. "
-        )
-        if local_tools:
-            system_prompt += (
-                "You have a local Python tool `internet_search`: use it for web search, current events, "
-                "or facts not covered by internal docs. Pass query, optional max_results (default 5), "
-                "topic (general|news|finance), and include_raw_content as needed. "
-            )
-        system_prompt += (
-            "When MCP tools are available: use `lookup_docs` for organization and leave-policy questions; "
-            "use `bingchuan` for 冰川 / Bingchuan ice cream or product-knowledge questions; "
-            "use `inspect_faiss` only for debugging the document index."
-        )
-        agent = create_deep_agent(
-            model=model,
-            tools=all_tools,
-            system_prompt=system_prompt,
-            subagents=_build_subagents(),
-            checkpointer=checkpointer,
-            backend=make_memory_backend,
-        )
+        fastapi_app.state.chat_model = model
+        fastapi_app.state.checkpointer = checkpointer
+        await _build_agent_and_mcp_status(fastapi_app)
         logger.info("Long-term memory directory (global): %s", GLOBAL_MEMORIES_DIR)
         logger.info("Checkpoint database: %s", CHECKPOINT_DB_PATH.resolve())
-        fastapi_app.state.agent = agent
-        fastapi_app.state.checkpointer = checkpointer
         yield
 
 
@@ -323,6 +688,60 @@ def _preview(text: str, max_len: int = 80) -> str:
     return t[: max_len - 1] + "…"
 
 
+@app.get("/settings/mcp", response_model=McpSettingsResponse)
+async def get_mcp_settings() -> McpSettingsResponse:
+    ## ⬇️ Last MCP load outcome (startup or after PUT /settings/mcp)
+    snap = getattr(app.state, "mcp_settings_response", None)
+    if snap is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    return snap
+
+
+@app.put("/settings/mcp", response_model=McpSettingsResponse)
+async def put_mcp_settings(body: McpSettingsPutBody) -> McpSettingsResponse:
+    ## ⬇️ Persist Streamable HTTP MCP servers and rebuild the deep agent with fresh tool bindings
+    if getattr(app.state, "checkpointer", None) is None or getattr(app.state, "chat_model", None) is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    try:
+        _persist_mcp_settings(body)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    try:
+        return await _build_agent_and_mcp_status(app)
+    except Exception as e:
+        logger.exception("MCP settings reload failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/sessions", response_model=SessionsListResponse)
+async def list_sessions(
+    limit: int = Query(50, ge=1, le=200, description="Max conversations to return, newest first"),
+) -> SessionsListResponse:
+    ## ⬇️ Hydrate the UI from LangGraph SQLite (same threads as POST /chat uses)
+    agent = getattr(app.state, "agent", None)
+    checkpointer = getattr(app.state, "checkpointer", None)
+    if agent is None or checkpointer is None:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    thread_ids = await _ordered_thread_ids(checkpointer, limit=limit)
+    payloads: list[SessionPayload] = []
+    for tid in thread_ids:
+        config = {"configurable": {"thread_id": tid}}
+        snap = await agent.aget_state(config)
+        raw = (snap.values or {}).get("messages") or []
+        transcript = _transcript_for_ui(raw)
+        if not transcript:
+            continue
+        payloads.append(
+            SessionPayload(
+                session_id=tid,
+                title=_session_title_from_transcript(transcript),
+                messages=transcript,
+            )
+        )
+    logger.info("GET /sessions count=%s (limit=%s)", len(payloads), limit)
+    return SessionsListResponse(sessions=payloads)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest) -> ChatResponse:
     agent = app.state.agent
@@ -333,6 +752,18 @@ async def chat(body: ChatRequest) -> ChatResponse:
         len(body.message),
         _preview(body.message),
     )
+
+    n_before = 0
+    try:
+        snap_before = await agent.aget_state(config)
+        prev_msgs = (
+            (snap_before.values or {}).get("messages")
+            if snap_before and snap_before.values
+            else None
+        )
+        n_before = len(prev_msgs or [])
+    except Exception:
+        logger.debug("aget_state before /chat failed; tool attribution may span full thread", exc_info=True)
 
     t0 = time.perf_counter()
     try:
@@ -348,6 +779,10 @@ async def chat(body: ChatRequest) -> ChatResponse:
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     raw_messages = result.get("messages") or []
+    if len(raw_messages) < n_before:
+        delta_messages = raw_messages
+    else:
+        delta_messages = raw_messages[n_before:]
     reply = _last_assistant_reply(raw_messages)
     if not reply and raw_messages:
         logger.warning(
@@ -362,6 +797,8 @@ async def chat(body: ChatRequest) -> ChatResponse:
             len(reply),
             _preview(reply, 120),
         )
+    used = _ordered_tool_uses(delta_messages)
+    reply = _ensure_tool_attribution(reply, used)
     return ChatResponse(reply=reply)
 
 
